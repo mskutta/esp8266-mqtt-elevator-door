@@ -371,26 +371,26 @@ void configModeCallback (WiFiManager *myWiFiManager) {
 
 void reconnect() {
   while (!client.connected()) {
-    Serial.println(F("MQTT Connecting..."));
+    oled.println(F("MQTT Connecting..."));
     if (client.connect(hostname)) {
-      Serial.println(F("MQTT connected"));
+      oled.println(F("MQTT connected"));
       client.subscribe(topicDoorOpen); // "elev-door-?/open"
     } else {
-      Serial.print(F("."));
+      oled.print(F("."));
       delay(1000);
     }
   }
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print(F("Message arrived ["));
-  Serial.print(topic);
-  Serial.print(F("] "));
+  oled.print(F("t:"));
+  oled.println(topic);
+  oled.print(F("p:"));
 
   for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
+    oled.print((char)payload[i]);
   }
-  Serial.println();
+  oled.println();
 
   if(strcmp(topic, topicDoorOpen) == 0) 
   {
