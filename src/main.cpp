@@ -218,7 +218,7 @@ void home() {
   tic.setTargetVelocity(-10000000);
   
   doorState = DoorState::Homing;
-  homingTimeout = millis() + 2000; // Wait 2s
+  homingTimeout = millis() + 5000; // Wait 5s
 }
 
 void homingTimedOut() {
