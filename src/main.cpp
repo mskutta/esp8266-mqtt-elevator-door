@@ -46,11 +46,8 @@ const char* ESP_NAME = "elev-door-rear";
 const char* DOOR_NAME = "rear";
 #endif
 
-const unsigned int OSC_PORT = 53000;
-
 const int CLOSED_POSITION = 0;
 const int OPEN_POSITION = 18600; // 18650
-const int MAX_CONTIGUOUS_RANGE_ERROR_COUNT = 1;
 
 const int HIGH_ACCURACY_TIMING_BUDGET = 200000;
 const int HIGH_SPEED_TIMING_BUDGET = 26000; // 20000 min
@@ -66,29 +63,34 @@ const int SENSOR1_ADDRESS = 43;
 const int SENSOR2_ADDRESS = 42;
 //const int SENSOR3_ADDRESS = 41; // Default
 
-const unsigned long OSC_MESSAGE_SEND_INTERVAL = 200; // 200 ms
+/* Constants */
+const unsigned long RUN_INTERVAL = 100;
 
 /* Variables */
+unsigned long nextRun = 0;
+unsigned long currentMillis = 0;
+
 enum class CallState {None, Up, Down};
 static const char *CallStateString[] = {"none", "up", "down"};
 CallState callState = CallState::None;
 CallState lastCallState = CallState::None;
 
-enum class DoorState {Unknown, Calibrating, Close, Closed, Closing, Open, Opening, Reopen, Reopening, Waiting};
-static const char *DoorStateString[] = {"unknown", "calibrating", "close", "closed", "closing", "open", "opening", "reopen", "reopening", "waiting"};
+enum class DoorState {Unknown, Homing, Close, Closed, Closing, Open, Opening, Reopen, Reopening, Waiting};
+static const char *DoorStateString[] = {"unknown", "homing", "close", "closed", "closing", "open", "opening", "reopen", "reopening", "waiting"};
 DoorState doorState = DoorState::Unknown;
 DoorState lastDoorState = DoorState::Unknown;
 
-unsigned long calibrateTimeout = 0;
+unsigned long homingTimeout = 0;
 unsigned long closeTimeout = 0;
 unsigned long openTimeout = 0;
 unsigned long waitTimeout = 0;
+bool isHomed = false;
+bool lastLimitActive = false;
 
 volatile int encoderCount = 0; //This variable will increase or decrease depending on the rotation of encoder
 int lastEncoderPosition = 0;
 
 bool doorOpenReceived = false;
-unsigned long oscSendTime;
 
 /* Display */
 SSD1306AsciiWire oled;
@@ -115,64 +117,65 @@ VL53L0X sensor3;
 /* Port Expander */
 Adafruit_MCP23008 mcp;
 
-int contiguousRangeErrorCount = 0;
-int lastRange = 0;
-int getRange() {
-  int range = 0;
+int lastRange1 = 0;
+int lastRange2 = 0;
+int lastRange3 = 0;
+
+bool getTripped() {
+  // any change > 100 is considered tripping
+
+  bool tripped1 = false;
   int range1 = _max(sensor1.readRangeContinuousMillimeters(), 30);
-  int range2 = _max(sensor2.readRangeContinuousMillimeters(), 30);
-  int range3 = _max(sensor3.readRangeContinuousMillimeters(), 30);
-  
-  // Calculate average range.  
-  int averageRange = (int) ((range1 + range2 + range3) / 3);
-  
-  // Determine error condition
-  int minRange = averageRange - 20;
-  int maxRange = averageRange + 20;
-  bool error = ((range1 > 1200) || (range2 > 1200) || (range3 > 1200) || 
-                (range1 < minRange) || (range1 > maxRange) || 
-                (range2 < minRange) || (range2 > maxRange) || 
-                (range3 < minRange) || (range3 > maxRange));
-                    
-  // Return error if occurred 2 times in a row
-  if (error) {
-    contiguousRangeErrorCount++;
-    if (contiguousRangeErrorCount >= MAX_CONTIGUOUS_RANGE_ERROR_COUNT) {
-      range = -1;
-    } else {
-      range = lastRange;
-    }
-  } else {
-    // No error
-    contiguousRangeErrorCount = 0;
-    range = lastRange = averageRange;
+  if (!sensor1.timeoutOccurred() && range1 < 1200) { 
+    tripped1 = (range1 < lastRange1 - 100) || (range1 > lastRange1 + 100);
+    lastRange1 = range1;
   }
+
+  bool tripped2 = false;
+  int range2 = _max(sensor2.readRangeContinuousMillimeters(), 30);
+  if (!sensor2.timeoutOccurred() && range2 < 1200) { 
+    tripped2 = (range2 < lastRange2 - 100) || (range2 > lastRange2 + 100);
+    lastRange2 = range2;
+  }
+
+  bool tripped3 = false;
+  int range3 = _max(sensor3.readRangeContinuousMillimeters(), 30);
+  if (!sensor3.timeoutOccurred() && range3 < 1200) {
+    tripped3 = (range3 < lastRange3 - 100) || (range3 > lastRange3 + 100);
+    lastRange3 = range3;
+  }
+
+  bool tripped = tripped1 || tripped2 || tripped3;
   
-  // Display Results if broken
-  if (averageRange > 100 && range == -1) {
+  // Display Results if tripped
+  if (tripped) {
     char buffer [5];
     
-    sprintf (buffer, "%4d", range1);
-    oled.print(buffer);
+    oled.print("trip ");
+
+    if (range1 < 1200) {
+      sprintf (buffer, "%4d", range1);
+      oled.print(buffer);
+    } else {
+      oled.print(F(" err"));
+    }
     
-    sprintf (buffer, "%4d", range2);
-    oled.print(buffer);
+    if (range2 < 1200) {
+      sprintf (buffer, "%4d", range2);
+      oled.print(buffer);
+    } else {
+      oled.print(F(" err"));
+    }
     
-    sprintf (buffer, "%4d", range3);
-    oled.print(buffer);
-    
-    sprintf (buffer, "%4d", averageRange);
-    oled.print(buffer);
-  
-    oled.println(F("*"));
+    if (range3 < 1200) {
+      sprintf (buffer, "%4d", range3);
+      oled.println(buffer);
+    } else {
+      oled.println(F(" err"));
+    }
   }
   
-  return range;
-}
-
-int getRangePosition(int range) {
-  if (range == -1) return -1;
-  return map(range, 0, 900, 0, 18650);
+  return tripped;
 }
 
 void setEncoderPosition(int position) {
@@ -203,80 +206,29 @@ void setHighSpeed() {
   sensor3.setMeasurementTimingBudget(HIGH_SPEED_TIMING_BUDGET);
 }
 
-void preCalibrate() {
-  doorState = DoorState::Calibrating;
-  setHighAccuracy();
-  calibrateTimeout = millis() + 500; // Wait 500ms
-}
-
-void calibrate2(int range) {
-  int rangePosition = getRangePosition(range);
-  setEncoderPosition(rangePosition);
-  setHighSpeed();
-}
-
-void calibrate() {
-  
-  oled.println(F("Calibrating..."));
-  
-  doorState = DoorState::Calibrating;
-  
-  // High Accuracy
-  setHighAccuracy();
-  
-  // Give the Tic some time to start up.
-  delay(500);
-
+void home() {
   tic.energize();
-  
-  // Door Calibration Settings
-  tic.setStepMode(TicStepMode::Microstep8); // 1/8 step: 200*8 = 1600 steps per revolution
+  tic.setStepMode(TicStepMode::Microstep8);
   tic.setCurrentLimit(1500);
-  tic.setMaxSpeed(30000000); // ~11.25 revolutions (18000 steps) to open door. 2 second open time = 9000 steps/sec
-  tic.setMaxAccel(200000); // 10000 steps/sec
-  tic.setMaxDecel(200000); // 10000 steps/sec
-
-  int range = getRange();
-  while((range = getRange()) == -1) {
-    delay(100);
-  }
-
-  // if range is less than 100mm, move into position to accurately measure
-  if (range < 100) {
-    tic.haltAndSetPosition(0);
-    tic.setTargetPosition(OPEN_POSITION / 2);
-    tic.exitSafeStart();
-    
-    while (tic.getCurrentPosition() != tic.getTargetPosition()) {
-      // Wait for in range position read
-      delay(20);
-      tic.resetCommandTimeout();
-    }
-    delay(1000);
-
-    while((range = getRange()) == -1) {
-      delay(100);
-    }
-  }
-
-  int rangePosition = getRangePosition(range);
-  setEncoderPosition(rangePosition);
-  tic.haltAndSetPosition(rangePosition);
-  tic.setTargetPosition(OPEN_POSITION);
+  tic.setMaxAccel(100000); // 10000 steps/sec
+  tic.setMaxDecel(100000); // 10000 steps/sec
+  tic.haltAndSetPosition(0); // Needed to set velocity
   tic.exitSafeStart();
-  while (tic.getCurrentPosition() != tic.getTargetPosition()) {
-    // Wait for in range position read
-    delay(20);
-    tic.resetCommandTimeout();
+
+  tic.setTargetVelocity(-10000000);
+  
+  doorState = DoorState::Homing;
+  homingTimeout = millis() + 2000; // Wait 2s
+}
+
+void homingTimedOut() {
+  oled.println(F("Homimg Timeout"));
+  oled.println(F("!!! CLODE DOOR !!!"));
+
+  if (tic.getEnergized()) {
+    tic.deenergize();
   }
-  
-  tic.deenergize();
-  
-  // High Speed
-  setHighSpeed();
-  
-  // Wait for door to timeout then close
-  waitDoor(DOOR_DWELL_1);
+  isHomed = false;
 }
 
 ISR_PREFIX void ai0() {
@@ -383,14 +335,14 @@ void reconnect() {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-  oled.print(F("t:"));
+  //oled.print(F("t:"));
   oled.println(topic);
-  oled.print(F("p:"));
+  //oled.print(F("p:"));
 
-  for (int i = 0; i < length; i++) {
-    oled.print((char)payload[i]);
-  }
-  oled.println();
+  //for (int i = 0; i < length; i++) {
+  //  oled.print((char)payload[i]);
+  //}
+  //oled.println();
 
   if(strcmp(topic, topicDoorOpen) == 0) 
   {
@@ -474,6 +426,7 @@ void setup() {
   /* TIC */
   // Set the TIC product
   tic.setProduct(TicProduct::T500);
+  tic.deenergize();
  
   /* VL53L0X */
   // WARNING: Shutdown pins of VL53L0X ACTIVE-LOW-ONLY NO TOLERANT TO 5V will fry them
@@ -517,7 +470,7 @@ void setup() {
   // Set up interrupts
   attachInterrupt(digitalPinToInterrupt(D5), ai0, RISING);
 
-  /* door switch */
+  /* limit switch */
   pinMode(D7, INPUT_PULLUP);
 
   /* Port Expander (MCP23008) */
@@ -550,16 +503,15 @@ void setup() {
   mcp.digitalWrite(7, HIGH);
 #endif
 
-  // Wait to view display
-  delay(2000);
-  
-  /* calibrate */
-  calibrate();
-
   /* MQTT */
   sprintf(topicDoorOpen, "%s/door/open", ESP_NAME);
   client.setServer(broker, 1883);
   client.setCallback(callback);
+
+  // Wait to view display and connect
+  delay(2000);
+
+  oled.println("!!! CLOSE DOOR !!!");
 }
 
 void loop() {
@@ -570,14 +522,48 @@ void loop() {
   }
   client.loop();
 
-  // Get range and position info
-  int range = getRange();
-  int encoderPosition = getEncoderPosition();
+  tic.resetCommandTimeout();
+
+  // limit switch
+  bool limitActive = (digitalRead(D7)==LOW);
+  if (limitActive == true && limitActive != lastLimitActive) {
+    if (tic.getEnergized()) {
+      tic.deenergize();
+    }
+    setEncoderPosition(0);
+    doorState = DoorState::Closed;
+    isHomed = true;
+    oled.println(F("Limit Switch"));
+  }
+  lastLimitActive = limitActive;
+
+  if (!isHomed) {
+    oled.invertDisplay(true);
+    return;
+  } else {
+    oled.invertDisplay(false);
+  }
+
+  // NOTE: for some reason the following (tic) needs to run at full speed for tic.getCurrentPosition to return reliable results.
+  // i.e. do not add a delay before calling the below.
+
+  // Get position info
   int currentPosition = tic.getCurrentPosition();
   int targetPosition = tic.getTargetPosition();
   
+  // Run the remainder of the loop once every 100ms
+  currentMillis = millis();
+  if (currentMillis < nextRun) {
+    return;
+  }
+  nextRun = currentMillis + RUN_INTERVAL;
+
+  // Get position and tripped info
+  int encoderPosition = getEncoderPosition();
+  bool tripped = getTripped(); // TODO: May need to only retrieve if encoder position is > 1000
+
   // Indicate if range error
-  if (range == -1) {
+  if (tripped) {
     digitalWrite(LED_BUILTIN, HIGH);
   } else {
     digitalWrite(LED_BUILTIN, LOW);
@@ -596,26 +582,18 @@ void loop() {
   bool openDoorRequested = doorOpenReceived;
   doorOpenReceived = false;
 
-  // Test Button
-  if (digitalRead(D7)==LOW) {
-    oled.invertDisplay(true);
-  } else {
-    oled.invertDisplay(false);
-  }
-  
   // Handle Door States
   if (doorState == DoorState::Waiting) {
     if (millis() > waitTimeout) {
-      preCalibrate();
+      preCloseDoor();
     }
-    else if (range == -1 || openDoorRequested || (encoderPosition != lastEncoderPosition)) {
+    else if (tripped || openDoorRequested || (encoderPosition != lastEncoderPosition)) {
       waitDoor(DOOR_DWELL_2);
     }
   }
-  else if (doorState == DoorState::Calibrating) {
-    if (millis() > calibrateTimeout && range != -1) {
-      calibrate2(range);
-      preCloseDoor();
+  else if (doorState == DoorState::Homing) {
+    if (millis() > homingTimeout) {
+      homingTimedOut();
     }
   }
   else if (doorState == DoorState::Close) {
@@ -625,11 +603,16 @@ void loop() {
   }
   else if (doorState == DoorState::Closing) {
     if (stopped) {
-      doorState = DoorState::Closed;
+      // door needs to be homed. Door should not stop before hitting limit switch
+      home();
     }
-    else if ((range == -1 && encoderPosition > 1000) || // beam break - reopen
+    else if ((tripped && encoderPosition > 1000) || // beam break - reopen
               positionCorrection < -64 || // door is being pushed - reopen
               openDoorRequested) { // open door requested
+      if (positionCorrection < -64) {
+        oled.print(F("drift: "));
+        oled.println(positionCorrection);
+      }
       preOpenDoor(true);
     }
     else if (positionCorrection > 64) { // door is being pulled - wait
@@ -710,7 +693,6 @@ void loop() {
   }
 
   lastEncoderPosition = encoderPosition;
-  tic.resetCommandTimeout();
 }
 
 
